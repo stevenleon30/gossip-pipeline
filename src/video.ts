@@ -1,10 +1,17 @@
 import 'dotenv/config';
 import Replicate from 'replicate';
 import fs from 'fs';
+import path from 'path';
 import https from 'https';
+import ffmpegPath from 'ffmpeg-static';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { VisualsOutput } from './agents.js';
+
+const execFileAsync = promisify(execFile);
 
 const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN,
+  ...(process.env.REPLICATE_API_TOKEN ? { auth: process.env.REPLICATE_API_TOKEN } : {}),
 });
 
 // ============================================================
@@ -113,7 +120,182 @@ function downloadFile(url: string, dest: string): Promise<void> {
 }
 
 // ============================================================
+// Generate voiceover audio
+// ============================================================
+
+async function generateVoiceover(text: string, outputPath: string): Promise<string> {
+  console.log(`Generating voiceover: ${text.slice(0, 50)}...`);
+
+  const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+  if (elevenLabsKey) {
+    try {
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+
+      const postData = JSON.stringify({
+        text,
+        model_id: 'eleven_multilingual_v2',
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        const req = https.request(
+          url,
+          {
+            method: 'POST',
+            headers: {
+              'Accept': 'audio/mpeg',
+              'Content-Type': 'application/json',
+              'xi-api-key': elevenLabsKey,
+            },
+          },
+          (res) => {
+            if (res.statusCode !== 200) {
+              let errData = '';
+              res.on('data', (chunk) => (errData += chunk));
+              res.on('end', () =>
+                reject(new Error(`ElevenLabs API returned status ${res.statusCode}: ${errData}`))
+              );
+              return;
+            }
+
+            const file = fs.createWriteStream(outputPath);
+            res.pipe(file);
+            file.on('finish', () => file.close(() => resolve()));
+          }
+        );
+
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+      });
+
+      console.log(`Saved voiceover to ${outputPath}`);
+      return outputPath;
+    } catch (err) {
+      console.warn('ElevenLabs voiceover generation failed:', err);
+    }
+  }
+
+  // Fallback placeholder
+  if (!fs.existsSync(outputPath)) {
+    fs.writeFileSync(outputPath, Buffer.from([]));
+  }
+  return outputPath;
+}
+
+// ============================================================
+// Sync voiceover audio track into video clip MP4
+// ============================================================
+
+async function mergeAudioAndVideo(videoPath: string, audioPath: string, outputPath: string): Promise<string> {
+  if (!ffmpegPath) {
+    console.warn('ffmpeg-static path not found, skipping audio merge.');
+    return videoPath;
+  }
+
+  if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size === 0) {
+    console.warn('Video file missing or empty, skipping audio merge.');
+    return videoPath;
+  }
+
+  if (!fs.existsSync(audioPath) || fs.statSync(audioPath).size === 0) {
+    console.warn('Audio file missing or empty, skipping audio merge.');
+    return videoPath;
+  }
+
+  const tempOutput = `${outputPath}.tmp.mp4`;
+
+  try {
+    console.log(`Syncing voiceover audio into video clip: ${path.basename(videoPath)}...`);
+    await execFileAsync(ffmpegPath, [
+      '-y',
+      '-i', videoPath,
+      '-i', audioPath,
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      '-ac', '2',
+      '-ar', '44100',
+      '-b:a', '128k',
+      '-map', '0:v:0',
+      '-map', '1:a:0',
+      tempOutput,
+    ]);
+
+    fs.renameSync(tempOutput, outputPath);
+    console.log(`Successfully synced voiceover into ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    console.warn(`Failed to merge audio into ${videoPath}:`, err);
+    if (fs.existsSync(tempOutput)) {
+      fs.unlinkSync(tempOutput);
+    }
+    return videoPath;
+  }
+}
+
+// ============================================================
+// Batch generate video clips & voiceovers
+// ============================================================
+
+async function generateClips(visuals: VisualsOutput): Promise<{ clips: { path: string }[]; voiceovers: { path: string }[] }> {
+  const outputDir = path.resolve(process.cwd(), 'output');
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  const generateAssets = process.env.GENERATE_ASSETS === 'true';
+  const clips: { path: string }[] = [];
+  const voiceovers: { path: string }[] = [];
+
+  const scenesToProcess = generateAssets ? visuals.scenePrompts : visuals.scenePrompts.slice(0, 1);
+
+  for (let i = 0; i < scenesToProcess.length; i++) {
+    const scene = scenesToProcess[i];
+    if (!scene) continue;
+
+    const clipPath = path.join(outputDir, `clip-${String(i + 1).padStart(2, '0')}.mp4`);
+    const voiceoverPath = path.join(outputDir, `voiceover-${String(i + 1).padStart(2, '0')}.mp3`);
+
+    if (generateAssets) {
+      try {
+        await generateClip(scene.prompt, scene.duration, clipPath);
+      } catch (err) {
+        console.warn(`Clip generation failed for scene ${i + 1}:`, err);
+        if (!fs.existsSync(clipPath)) {
+          fs.writeFileSync(clipPath, Buffer.from([]));
+        }
+      }
+
+      try {
+        await generateVoiceover(scene.voiceoverText, voiceoverPath);
+      } catch (err) {
+        console.warn(`Voiceover generation failed for scene ${i + 1}:`, err);
+        if (!fs.existsSync(voiceoverPath)) {
+          fs.writeFileSync(voiceoverPath, Buffer.from([]));
+        }
+      }
+
+      // Sync voiceover audio track into clip MP4 video
+      await mergeAudioAndVideo(clipPath, voiceoverPath, clipPath);
+    } else {
+      console.log(`Asset generation not enabled for scene ${i + 1}. Creating placeholder clip and voiceover paths.`);
+      if (!fs.existsSync(clipPath)) {
+        fs.writeFileSync(clipPath, Buffer.from([]));
+      }
+      if (!fs.existsSync(voiceoverPath)) {
+        fs.writeFileSync(voiceoverPath, Buffer.from([]));
+      }
+    }
+
+    clips.push({ path: clipPath });
+    voiceovers.push({ path: voiceoverPath });
+  }
+
+  return { clips, voiceovers };
+}
+
+// ============================================================
 // Exports
 // ============================================================
 
-export { generateClip };
+export { generateClip, generateVoiceover, generateClips, mergeAudioAndVideo };

@@ -40,7 +40,7 @@ export interface VisualsOutput {
 }
 
 // ============================================================
-// JSON parsing helper (handles Claude's markdown wrapping)
+// JSON parsing helper (handles Claude's markdown wrapping & quotation issues)
 // ============================================================
 
 function parseJsonOutput(text: any) {
@@ -64,7 +64,21 @@ function parseJsonOutput(text: any) {
   }
 
   console.log('parseJsonOutput cleaned JSON:', cleaned);
-  return JSON.parse(cleaned);
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (err) {
+    console.warn('Direct JSON.parse failed, attempting repair for unescaped quotes...');
+    // Replace unescaped double quotes inside strings with single quotes or escaped quotes
+    const repaired = cleaned.replace(/(?<=:\s*"|\[\s*"|,\s*")[^"]*?(?="[\s,}])/g, (match) => {
+      return match.replace(/"/g, "'");
+    });
+    try {
+      return JSON.parse(repaired);
+    } catch {
+      throw err; // throw original error if repair didn't work
+    }
+  }
 }
 
 // ============================================================
@@ -84,7 +98,7 @@ ${productUrl ? `URL: ${productUrl}` : ''}
 
 Find 3 potential gossip angles for this product. Think drama, controversy, "I can't believe this works," before/after shock, or a hidden detail.
 
-CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Start your response with { and end with }.
+CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
 
 {
   "product": "${productName}",
@@ -98,7 +112,8 @@ CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fence
     }],
   });
 
-  const text = res.content[0].type === 'text' ? res.content[0].text : '';
+  const first = res.content[0];
+  const text = first && first.type === 'text' ? first.text : '';
   return parseJsonOutput(text);
 }
 
@@ -131,7 +146,7 @@ Rules:
 - Include an #ad disclosure naturally
 - The product should be the punchline, not the pitch
 
-CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Start your response with { and end with }.
+CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
 
 {
   "script": "full script as one string with line breaks",
@@ -145,7 +160,8 @@ CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fence
     }],
   });
 
-  const text = res.content[0].type === 'text' ? res.content[0].text : '';
+  const firstScriptBlock = res.content[0];
+  const text = firstScriptBlock && firstScriptBlock.type === 'text' ? firstScriptBlock.text : '';
   return parseJsonOutput(text);
 }
 
@@ -171,7 +187,7 @@ Rules:
 - Keep visual continuity where possible
 - Avoid prompts that could trigger model safety filters (no real celebrities, no controversial imagery)
 
-CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fences. Start your response with { and end with }.
+CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
 
 {
   "scenePrompts": [
@@ -181,14 +197,26 @@ CRITICAL: Return ONLY the raw JSON object. Do NOT wrap it in markdown code fence
     }],
   });
 
-  const text = res.content[0].type === 'text' ? res.content[0].text : '';
+  const firstVisualBlock = res.content[0];
+  const text = firstVisualBlock && firstVisualBlock.type === 'text' ? firstVisualBlock.text : '';
   return parseJsonOutput(text);
 }
 
 // ============================================================
-// Exports
+// Exports & Helper Wrappers
 // ============================================================
-// Exports
-// ============================================================
+
+export async function runResearcher(product: string): Promise<ResearchOutput> {
+  const isUrl = product.startsWith('http://') || product.startsWith('https://');
+  return researchProduct(product, isUrl ? product : undefined);
+}
+
+export async function runStoryWriter(research: ResearchOutput, chosenAngleIndex = 0): Promise<ScriptOutput> {
+  return writeScript(research, chosenAngleIndex);
+}
+
+export async function runVisualDirector(scriptOutput: ScriptOutput): Promise<VisualsOutput> {
+  return directVisuals(scriptOutput);
+}
 
 export { researchProduct, writeScript, directVisuals };

@@ -1,16 +1,14 @@
-require('dotenv/config');
-import fs = require('fs');
-import path = require('path');
+import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import agents = require('./agents');
-import video = require('./video');
-
-interface PipelineConfig {
-	productName: string;
-	productUrl?: string;
-	angleIndex: number;
-	generateAssets: boolean;
-}
+import {
+	runResearcher,
+	runStoryWriter,
+	runVisualDirector,
+} from './agents.js';
+import { generateClips } from './video.js';
 
 function ensureOutputDir(): string {
 	const dir = path.resolve(process.cwd(), 'output');
@@ -21,73 +19,61 @@ function ensureOutputDir(): string {
 	return dir;
 }
 
-async function runPipeline(config: PipelineConfig): Promise<void> {
+export async function runPipeline(product: string) {
 	const outputDir = ensureOutputDir();
 
 	console.log('1) Researching product angles...');
-	const research = await agents.researchProduct(config.productName, config.productUrl);
+	const researchResult = await runResearcher(product);
 	fs.writeFileSync(
 		path.join(outputDir, 'research.json'),
-		JSON.stringify(research, null, 2),
+		JSON.stringify(researchResult, null, 2),
 		'utf8'
 	);
 
-	console.log(`2) Writing script with angle #${config.angleIndex}...`);
-	const script = await agents.writeScript(research, config.angleIndex);
+	console.log('2) Writing script...');
+	const scriptResult = await runStoryWriter(researchResult);
 	fs.writeFileSync(
 		path.join(outputDir, 'script.json'),
-		JSON.stringify(script, null, 2),
+		JSON.stringify(scriptResult, null, 2),
 		'utf8'
 	);
 
 	console.log('3) Creating visual direction prompts...');
-	const visuals = await agents.directVisuals(script);
+	const visualsResult = await runVisualDirector(scriptResult);
 	fs.writeFileSync(
 		path.join(outputDir, 'visuals.json'),
-		JSON.stringify(visuals, null, 2),
+		JSON.stringify(visualsResult, null, 2),
 		'utf8'
 	);
 
-	if (!config.generateAssets) {
-		console.log('Done. JSON outputs saved to output/.');
-		console.log('Set GENERATE_ASSETS=true to also render one video clip + voiceover.');
-		return;
-	}
+	console.log('4) Generating clips & voiceovers...');
+	const { clips, voiceovers } = await generateClips(visualsResult);
 
-	const firstScene = visuals.scenePrompts[0];
-	if (!firstScene) {
-		throw new Error('No scene prompts returned; cannot generate media assets.');
-	}
-
-	console.log('4) Generating one sample video clip...');
-	const clipPath = path.join(outputDir, 'clip-01.mp4');
-	await video.generateClip(firstScene.prompt, firstScene.duration, clipPath);
-
-	console.log('5) Generating voiceover for that scene...');
-	const voiceoverPath = path.join(outputDir, 'voiceover-01.mp3');
-	await video.generateVoiceover(firstScene.voiceoverText, voiceoverPath);
-
-	console.log('Pipeline complete. Files saved in output/.');
+	return {
+		caption: scriptResult.caption,
+		script: scriptResult.scenes,
+		clips: clips.map((c) => c.path), // paths to your generated mp4 files
+		voiceovers: voiceovers.map((v) => v.path), // paths to your generated mp3 files
+	};
 }
 
 async function main(): Promise<void> {
-	const productUrl = process.env.PRODUCT_URL;
+	const product =
+		process.env.PRODUCT_NAME ||
+		process.env.PRODUCT_URL ||
+		'Sol de Janeiro Brazilian Bum Bum Cream';
 
-	const config: PipelineConfig = {
-		productName: process.env.PRODUCT_NAME ?? 'Sol de Janeiro Brazilian Bum Bum Cream',
-		angleIndex: Number.parseInt(process.env.ANGLE_INDEX ?? '0', 10),
-		generateAssets: process.env.GENERATE_ASSETS === 'true',
-	};
-
-	if (productUrl) {
-		config.productUrl = productUrl;
-	}
-
-	await runPipeline(config);
+	const result = await runPipeline(product);
+	console.log('Pipeline complete:', JSON.stringify(result, null, 2));
 }
 
-main().catch((error: unknown) => {
-	const message = error instanceof Error ? error.stack ?? error.message : String(error);
-	console.error(message);
-	process.exitCode = 1;
-});
+const nodePath = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const thisPath = fileURLToPath(import.meta.url);
+
+if (nodePath === thisPath) {
+	main().catch((error: unknown) => {
+		const message = error instanceof Error ? error.stack ?? error.message : String(error);
+		console.error(message);
+		process.exitCode = 1;
+	});
+}
