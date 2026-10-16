@@ -1,125 +1,151 @@
 import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
+import {
+  validateResearch,
+  validateScript,
+  validateVisuals,
+  type ResearchOutput,
+  type ScriptOutput,
+  type VisualsOutput,
+} from './validate.js';
 
-const anthropic = new Anthropic();
-const MODEL = 'claude-sonnet-4-6';
+export type {
+  ResearchOutput,
+  ScriptOutput,
+  ScriptScene,
+  ScenePrompt,
+  VisualsOutput,
+} from './validate.js';
+
+// Override with ANTHROPIC_MODEL to try another model without touching code.
+export const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
+
+// Created lazily so importing this file never crashes when the key is missing.
+// The error shows up when an agent actually runs.
+let client: Anthropic | undefined;
+function getClient(): Anthropic {
+  client ??= new Anthropic();
+  return client;
+}
 
 // ============================================================
-// Types
+// Structured output via forced tool use
 // ============================================================
+// Each agent must "call" one tool whose input schema is the output shape.
+// That replaces regex JSON cleanup and quote repair. The result is still
+// validated at runtime, because a schema is a request, not a guarantee.
 
-export interface ResearchOutput {
-  product: string;
-  factsKnownToYou: string[];
-  angles: { angle: string; hook: string }[];
-}
+type InputSchema = Anthropic.Tool['input_schema'];
 
-export interface ScriptScene {
-  time: string;
-  text: string;
-  emotion: string;
-  visual: string;
-}
-
-export interface ScriptOutput {
-  script: string;
-  scenes: ScriptScene[];
-  caption: string;
-  hashtags: string[];
-}
-
-export interface ScenePrompt {
-  sceneIndex: number;
-  duration: number;
+interface StructuredCall<T> {
+  name: string;
+  description: string;
+  schema: InputSchema;
   prompt: string;
-  voiceoverText: string;
+  maxTokens: number;
+  validate: (input: unknown) => T;
 }
 
-export interface VisualsOutput {
-  scenePrompts: ScenePrompt[];
-}
+async function callStructured<T>(opts: StructuredCall<T>): Promise<T> {
+  const res = await getClient().messages.create({
+    model: MODEL,
+    max_tokens: opts.maxTokens,
+    tools: [{ name: opts.name, description: opts.description, input_schema: opts.schema }],
+    tool_choice: { type: 'tool', name: opts.name },
+    messages: [{ role: 'user', content: opts.prompt }],
+  });
 
-// ============================================================
-// JSON parsing helper (handles Claude's markdown wrapping & quotation issues)
-// ============================================================
-
-function parseJsonOutput(text: any) {
-  if (typeof text !== 'string') {
-    console.error('parseJsonOutput received non-string:', typeof text, text);
-    throw new Error(`parseJsonOutput expected string, got ${typeof text}`);
+  if (res.stop_reason === 'max_tokens') {
+    throw new Error(`${opts.name}: output was truncated (max_tokens=${opts.maxTokens}). Raise the limit.`);
   }
 
-  let cleaned = text.trim();
-
-  // Strip markdown code fences if Claude wrapped the JSON
-  cleaned = cleaned.replace(/^```(?:json)?\s*/i, '');
-  cleaned = cleaned.replace(/\s*```\s*$/, '');
-
-  // Extract just the JSON object even if there's preamble text
-  const firstBrace = cleaned.indexOf('{');
-  const lastBrace = cleaned.lastIndexOf('}');
-
-  if (firstBrace !== -1 && lastBrace !== -1) {
-    cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+  const block = res.content.find((b) => b.type === 'tool_use');
+  if (!block || block.type !== 'tool_use') {
+    throw new Error(`${opts.name}: model did not return the expected tool call.`);
   }
 
-  console.log('parseJsonOutput cleaned JSON:', cleaned);
-
-  try {
-    return JSON.parse(cleaned);
-  } catch (err) {
-    console.warn('Direct JSON.parse failed, attempting repair for unescaped quotes...');
-    // Replace unescaped double quotes inside strings with single quotes or escaped quotes
-    const repaired = cleaned.replace(/(?<=:\s*"|\[\s*"|,\s*")[^"]*?(?="[\s,}])/g, (match) => {
-      return match.replace(/"/g, "'");
-    });
-    try {
-      return JSON.parse(repaired);
-    } catch {
-      throw err; // throw original error if repair didn't work
-    }
-  }
+  return opts.validate(block.input);
 }
 
 // ============================================================
 // Agent 1: Story Researcher
 // ============================================================
 
+const researchSchema: InputSchema = {
+  type: 'object',
+  properties: {
+    product: { type: 'string' },
+    factsKnownToYou: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Facts you are confident are true about the product.',
+    },
+    angles: {
+      type: 'array',
+      minItems: 3,
+      maxItems: 3,
+      items: {
+        type: 'object',
+        properties: {
+          angle: { type: 'string', description: 'Short description of the gossip angle' },
+          hook: { type: 'string', description: 'Opening line for this angle' },
+        },
+        required: ['angle', 'hook'],
+      },
+    },
+  },
+  required: ['product', 'factsKnownToYou', 'angles'],
+};
+
 async function researchProduct(productName: string, productUrl?: string): Promise<ResearchOutput> {
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: `You research products and find the gossip-worthy angle that makes great TikTok storytime content.
+  return callStructured({
+    name: 'submit_research',
+    description: 'Submit the researched facts and three gossip angles for the product.',
+    schema: researchSchema,
+    maxTokens: 1500,
+    validate: validateResearch,
+    prompt: `You find the gossip-worthy angle that makes great TikTok storytime content for a product.
 
 Product: ${productName}
 ${productUrl ? `URL: ${productUrl}` : ''}
 
-Find 3 potential gossip angles for this product. Think drama, controversy, "I can't believe this works," before/after shock, or a hidden detail.
+Find 3 potential gossip angles. Think drama, "I can't believe this works," before/after shock, or a hidden detail.
 
-CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
-
-{
-  "product": "${productName}",
-  "factsKnownToYou": ["fact 1", "fact 2", "fact 3"],
-  "angles": [
-    { "angle": "short description", "hook": "the opening line for this angle" },
-    { "angle": "...", "hook": "..." },
-    { "angle": "...", "hook": "..." }
-  ]
-}`,
-    }],
+Ground rules:
+- You have no web access. Work only from what you actually know.
+- Only list facts you are confident are true. If you know little about this product, say so in the facts instead of guessing.
+- Do not invent statistics, lawsuits, recalls, studies, or health claims.
+- Angles can be about the experience of using the product, not just trivia.`,
   });
-
-  const first = res.content[0];
-  const text = first && first.type === 'text' ? first.text : '';
-  return parseJsonOutput(text);
 }
 
 // ============================================================
 // Agent 2: Story Writer
 // ============================================================
+
+const scriptSchema: InputSchema = {
+  type: 'object',
+  properties: {
+    script: { type: 'string', description: 'Full script as one string with line breaks' },
+    scenes: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          time: { type: 'string', description: 'For example 0:00-0:05' },
+          text: { type: 'string', description: 'What is said in this beat' },
+          emotion: { type: 'string' },
+          visual: { type: 'string', description: 'What is on screen' },
+        },
+        required: ['time', 'text', 'emotion', 'visual'],
+      },
+    },
+    caption: { type: 'string', description: 'TikTok caption that includes the #ad disclosure' },
+    hashtags: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['script', 'scenes', 'caption', 'hashtags'],
+};
 
 async function writeScript(research: ResearchOutput, chosenAngleIndex = 0): Promise<ScriptOutput> {
   const angle = research.angles[chosenAngleIndex];
@@ -127,87 +153,78 @@ async function writeScript(research: ResearchOutput, chosenAngleIndex = 0): Prom
     throw new Error(`Invalid angle index: ${chosenAngleIndex}.`);
   }
 
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 3000,
-    messages: [{
-      role: 'user',
-      content: `You write TikTok storytime scripts in first-person gossip voice. The script should sound like a real person texting their best friend, not an ad.
+  return callStructured({
+    name: 'submit_script',
+    description: 'Submit the finished TikTok storytime script, scene beats, caption, and hashtags.',
+    schema: scriptSchema,
+    maxTokens: 3000,
+    validate: validateScript,
+    prompt: `You write TikTok storytime scripts in first-person gossip voice. The script should sound like a real person texting their best friend, not an ad.
 
 Product: ${research.product}
+Known facts: ${JSON.stringify(research.factsKnownToYou)}
 Angle: ${angle.angle}
 Opening hook idea: ${angle.hook}
 
 Rules:
 - 45 to 60 seconds total
 - Hook in the first 3 seconds
-- Structure: hook -> escalation with specific (real or plausible) detail -> the reveal -> soft product mention -> CTA that doesn't feel like a CTA
+- Structure: hook -> escalation -> the reveal -> soft product mention -> CTA that doesn't feel like a CTA
+- Escalate with relatable, everyday detail. Do not invent statistics, studies, medical claims, or specific events involving real people or brands.
 - Use casual phrases like "literally," "I'm not even kidding," "wait wait wait"
-- Include an #ad disclosure naturally
-- The product should be the punchline, not the pitch
-
-CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
-
-{
-  "script": "full script as one string with line breaks",
-  "scenes": [
-    { "time": "0:00-0:05", "text": "what's said in this beat", "emotion": "incredulous", "visual": "what's on screen" },
-    { "time": "0:05-0:15", "text": "...", "emotion": "...", "visual": "..." }
-  ],
-  "caption": "TikTok caption with disclosure and hashtags",
-  "hashtags": ["#storytime", "#ad", "..."]
-}`,
-    }],
+- Include an #ad disclosure naturally, in the script and the caption
+- The product should be the punchline, not the pitch`,
   });
-
-  const firstScriptBlock = res.content[0];
-  const text = firstScriptBlock && firstScriptBlock.type === 'text' ? firstScriptBlock.text : '';
-  return parseJsonOutput(text);
 }
 
 // ============================================================
 // Agent 3: Visual Director
 // ============================================================
 
+const visualsSchema: InputSchema = {
+  type: 'object',
+  properties: {
+    scenePrompts: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          sceneIndex: { type: 'integer' },
+          duration: { type: 'number', description: 'Seconds, 5 to 8' },
+          prompt: { type: 'string', description: 'Vertical 9:16 UGC video prompt for the video model' },
+          voiceoverText: { type: 'string', description: 'Exact words spoken over this clip' },
+        },
+        required: ['sceneIndex', 'duration', 'prompt', 'voiceoverText'],
+      },
+    },
+  },
+  required: ['scenePrompts'],
+};
+
 async function directVisuals(scriptOutput: ScriptOutput): Promise<VisualsOutput> {
-  const res = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 4000,
-    messages: [{
-      role: 'user',
-      content: `You turn TikTok storytime scripts into scene-by-scene video prompts for AI video generation (Seedance model). Each scene is 5-8 seconds.
+  return callStructured({
+    name: 'submit_scene_prompts',
+    description: 'Submit scene-by-scene video prompts and voiceover text.',
+    schema: visualsSchema,
+    maxTokens: 4000,
+    validate: validateVisuals,
+    prompt: `You turn TikTok storytime scripts into scene-by-scene video prompts for AI video generation (Seedance model). Each scene is 5-8 seconds.
 
 Script scenes:
 ${JSON.stringify(scriptOutput.scenes, null, 2)}
 
 Rules:
 - Vertical 9:16 format
-- UGC aesthetic, NOT cinematic. Think iPhone footage, natural light, real bedrooms or cafés.
+- UGC aesthetic, NOT cinematic. Think iPhone footage, natural light, real bedrooms or cafes.
 - Match the emotional beat
 - Keep visual continuity where possible
-- Avoid prompts that could trigger model safety filters (no real celebrities, no controversial imagery)
-
-CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdown code fences. Never put unescaped double quotes inside string values (use single quotes for interior quotes). Start your response with { and end with }.
-
-{
-  "scenePrompts": [
-    { "sceneIndex": 0, "duration": 6, "prompt": "vertical 9:16 UGC video of...", "voiceoverText": "exact words spoken over this clip" }
-  ]
-}`,
-    }],
+- Avoid prompts that could trigger model safety filters (no real celebrities, no controversial imagery)`,
   });
-
-  if (res.stop_reason === 'max_tokens') {
-    throw new Error('Visual director output was truncated (max_tokens reached).');
-  }
-
-  const firstVisualBlock = res.content[0];
-  const text = firstVisualBlock && firstVisualBlock.type === 'text' ? firstVisualBlock.text : '';
-  return parseJsonOutput(text);
 }
 
 // ============================================================
-// Exports & Helper Wrappers
+// Exports and helper wrappers
 // ============================================================
 
 export async function runResearcher(product: string): Promise<ResearchOutput> {

@@ -1,18 +1,31 @@
 {
   "name": "gossip-pipeline",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "1.1.0",
+  "description": "Three Claude agents that turn a product into a TikTok storytime script, scene prompts, and optional video clips.",
+  "private": true,
   "scripts": {
     "start": "tsx src/server.ts",
     "dev": "tsx watch src/server.ts",
     "pipeline": "tsx src/index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/*.test.ts"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "claude",
+    "anthropic",
+    "ai-agents",
+    "tiktok",
+    "ugc",
+    "seedance",
+    "replicate",
+    "typescript"
+  ],
+  "author": "Steven Leon",
   "license": "ISC",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.98.0",
     "cors": "^2.8.6",

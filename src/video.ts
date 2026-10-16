@@ -1,18 +1,61 @@
 import 'dotenv/config';
 import Replicate from 'replicate';
-import fs from 'fs';
-import path from 'path';
-import https from 'https';
-import ffmpegPath from 'ffmpeg-static';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream as NodeWebStream } from 'node:stream/web';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { VisualsOutput } from './agents.js';
+import ffmpegStatic from 'ffmpeg-static';
+import type { VisualsOutput } from './validate.js';
 
 const execFileAsync = promisify(execFile);
+
+// ffmpeg-static ships CommonJS typings that clash with NodeNext default imports.
+const ffmpegPath = ffmpegStatic as unknown as string | null;
 
 const replicate = new Replicate({
   ...(process.env.REPLICATE_API_TOKEN ? { auth: process.env.REPLICATE_API_TOKEN } : {}),
 });
+
+// Seedance Lite on Replicate. Confirm the slug and input options on the model page
+// if this ever starts failing, since hosted models get renamed and retired.
+const VIDEO_MODEL = process.env.VIDEO_MODEL || 'bytedance/seedance-1-lite';
+
+// ============================================================
+// Pull a video URL out of whatever shape Replicate returns
+// ============================================================
+
+function urlFromFileLike(v: unknown): string | undefined {
+  if (typeof v === 'string') return v;
+  if (v && typeof (v as { url?: unknown }).url === 'function') {
+    const result = (v as { url: () => unknown }).url();
+    return result instanceof URL ? result.href : String(result);
+  }
+  return undefined;
+}
+
+export function extractVideoUrl(output: unknown): string | undefined {
+  // FileOutput object, plain string, or an array of either
+  const direct = urlFromFileLike(output);
+  if (direct) return direct;
+
+  if (Array.isArray(output)) {
+    return output.length > 0 ? urlFromFileLike(output[0]) : undefined;
+  }
+
+  // Older shape: object with the URL under a property
+  if (output && typeof output === 'object') {
+    const o = output as Record<string, unknown>;
+    for (const key of ['url', 'output', 'video', 'video_url']) {
+      const candidate = o[key];
+      if (typeof candidate === 'string') return candidate;
+    }
+  }
+
+  return undefined;
+}
 
 // ============================================================
 // Generate one video clip via Seedance on Replicate
@@ -24,167 +67,90 @@ async function generateClip(prompt: string, duration: number, outputPath: string
   // Seedance Lite supports 5-10 second clips
   const safeDuration = Math.min(Math.max(duration, 5), 10);
 
-  const output: any = await replicate.run(
-    'bytedance/seedance-1-lite',
-    {
-      input: {
-        prompt,
-        duration: safeDuration,
-        aspect_ratio: '9:16',
-        resolution: '720p',
-        fps: 24,
-      },
-    }
-  );
+  const output = await replicate.run(VIDEO_MODEL as `${string}/${string}`, {
+    input: {
+      prompt,
+      duration: safeDuration,
+      aspect_ratio: '9:16',
+      resolution: '720p',
+      fps: 24,
+    },
+  });
 
-  // Debug logging — see exactly what Seedance returned
-  console.log('\n=== SEEDANCE RAW OUTPUT ===');
-  console.log('Type:', typeof output);
-  console.log('Is array:', Array.isArray(output));
-  console.log('Constructor:', output?.constructor?.name);
-  console.log('Has url method:', typeof output?.url === 'function');
-  console.log('Keys:', output && typeof output === 'object' ? Object.keys(output) : 'n/a');
-  console.log('=== END ===\n');
-
-  // Extract the video URL from whatever shape Replicate returned
-  let videoUrl: string | undefined;
-
-  // Case 1: Newer Replicate SDK returns a FileOutput object with .url() method
-  if (output && typeof output.url === 'function') {
-    const urlResult = output.url();
-    videoUrl = urlResult instanceof URL ? urlResult.href : String(urlResult);
-  }
-  // Case 2: Direct string URL
-  else if (typeof output === 'string') {
-    videoUrl = output;
-  }
-  // Case 3: Array of FileOutputs or strings
-  else if (Array.isArray(output) && output.length > 0) {
-    const first = output[0];
-    if (first && typeof first.url === 'function') {
-      const urlResult = first.url();
-      videoUrl = urlResult instanceof URL ? urlResult.href : String(urlResult);
-    } else if (typeof first === 'string') {
-      videoUrl = first;
-    }
-  }
-  // Case 4: Object with URL nested in a property
-  else if (output && typeof output === 'object') {
-    videoUrl = output.url || output.output || output.video || output.video_url;
-  }
-
+  const videoUrl = extractVideoUrl(output);
   if (!videoUrl) {
-    console.error('Could not extract URL. Output was:', output);
-    throw new Error('No video URL returned from Seedance');
+    console.error('Could not extract a video URL. Output was:', output);
+    throw new Error('No video URL returned from the video model');
   }
 
-  console.log('Extracted video URL:', videoUrl);
   await downloadFile(videoUrl, outputPath);
-  console.log(`Saved to ${outputPath}`);
+  console.log(`Saved ${outputPath}`);
   return outputPath;
 }
 
 // ============================================================
-// Helper: download a file from a URL to disk
+// Helper: download a file from a URL to disk (fetch follows redirects)
 // ============================================================
 
-function downloadFile(url: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
+export async function downloadFile(url: string, dest: string): Promise<void> {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`Download failed with status ${res.status}`);
+  }
 
-    https
-      .get(url, (response) => {
-        // Handle redirects
-        if (response.statusCode === 301 || response.statusCode === 302) {
-          if (response.headers.location) {
-            file.close();
-            return downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-          }
-        }
-
-        if (response.statusCode && response.statusCode >= 400) {
-          file.close();
-          if (fs.existsSync(dest)) fs.unlinkSync(dest);
-          return reject(new Error(`Download failed with status ${response.statusCode}`));
-        }
-
-        response.pipe(file);
-        file.on('finish', () => file.close(() => resolve()));
-      })
-      .on('error', (err) => {
-        file.close();
-        if (fs.existsSync(dest)) fs.unlinkSync(dest);
-        reject(err);
-      });
-  });
+  try {
+    await pipeline(Readable.fromWeb(res.body as unknown as NodeWebStream), fs.createWriteStream(dest));
+  } catch (err) {
+    fs.rmSync(dest, { force: true });
+    throw err;
+  }
 }
 
 // ============================================================
-// Generate voiceover audio
+// Generate voiceover audio (ElevenLabs). Returns generated=false on fallback.
 // ============================================================
 
-async function generateVoiceover(text: string, outputPath: string): Promise<string> {
+async function generateVoiceover(
+  text: string,
+  outputPath: string
+): Promise<{ path: string; generated: boolean; warning?: string }> {
+  const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+
+  if (!elevenLabsKey) {
+    fs.writeFileSync(outputPath, Buffer.from([]));
+    return { path: outputPath, generated: false, warning: 'ELEVENLABS_API_KEY not set, wrote an empty voiceover file.' };
+  }
+
   console.log(`Generating voiceover: ${text.slice(0, 50)}...`);
 
-  const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-  if (elevenLabsKey) {
-    try {
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-      const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+  try {
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: {
+        Accept: 'audio/mpeg',
+        'Content-Type': 'application/json',
+        'xi-api-key': elevenLabsKey,
+      },
+      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2' }),
+    });
 
-      const postData = JSON.stringify({
-        text,
-        model_id: 'eleven_multilingual_v2',
-      });
-
-      await new Promise<void>((resolve, reject) => {
-        const req = https.request(
-          url,
-          {
-            method: 'POST',
-            headers: {
-              'Accept': 'audio/mpeg',
-              'Content-Type': 'application/json',
-              'xi-api-key': elevenLabsKey,
-            },
-          },
-          (res) => {
-            if (res.statusCode !== 200) {
-              let errData = '';
-              res.on('data', (chunk) => (errData += chunk));
-              res.on('end', () =>
-                reject(new Error(`ElevenLabs API returned status ${res.statusCode}: ${errData}`))
-              );
-              return;
-            }
-
-            const file = fs.createWriteStream(outputPath);
-            res.pipe(file);
-            file.on('finish', () => file.close(() => resolve()));
-          }
-        );
-
-        req.on('error', reject);
-        req.write(postData);
-        req.end();
-      });
-
-      console.log(`Saved voiceover to ${outputPath}`);
-      return outputPath;
-    } catch (err) {
-      console.warn('ElevenLabs voiceover generation failed:', err);
+    if (!res.ok || !res.body) {
+      throw new Error(`ElevenLabs returned status ${res.status}: ${await res.text()}`);
     }
-  }
 
-  // Fallback placeholder
-  if (!fs.existsSync(outputPath)) {
+    await pipeline(Readable.fromWeb(res.body as unknown as NodeWebStream), fs.createWriteStream(outputPath));
+    console.log(`Saved ${outputPath}`);
+    return { path: outputPath, generated: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
     fs.writeFileSync(outputPath, Buffer.from([]));
+    return { path: outputPath, generated: false, warning: `Voiceover failed: ${message}` };
   }
-  return outputPath;
 }
 
 // ============================================================
-// Sync voiceover audio track into video clip MP4
+// Mux the voiceover audio into the video clip
 // ============================================================
 
 async function mergeAudioAndVideo(videoPath: string, audioPath: string, outputPath: string): Promise<string> {
@@ -206,7 +172,7 @@ async function mergeAudioAndVideo(videoPath: string, audioPath: string, outputPa
   const tempOutput = `${outputPath}.tmp.mp4`;
 
   try {
-    console.log(`Syncing voiceover audio into video clip: ${path.basename(videoPath)}...`);
+    console.log(`Merging voiceover into ${path.basename(videoPath)}...`);
     await execFileAsync(ffmpegPath, [
       '-y',
       '-i', videoPath,
@@ -222,76 +188,73 @@ async function mergeAudioAndVideo(videoPath: string, audioPath: string, outputPa
     ]);
 
     fs.renameSync(tempOutput, outputPath);
-    console.log(`Successfully synced voiceover into ${outputPath}`);
     return outputPath;
   } catch (err) {
     console.warn(`Failed to merge audio into ${videoPath}:`, err);
-    if (fs.existsSync(tempOutput)) {
-      fs.unlinkSync(tempOutput);
-    }
+    fs.rmSync(tempOutput, { force: true });
     return videoPath;
   }
 }
 
 // ============================================================
-// Batch generate video clips & voiceovers
+// Batch generate clips and voiceovers
 // ============================================================
 
-async function generateClips(visuals: VisualsOutput): Promise<{ clips: { path: string }[]; voiceovers: { path: string }[] }> {
+export interface GenerateClipsResult {
+  clips: { path: string }[];
+  voiceovers: { path: string }[];
+  // Anything that did not go to plan. Empty means everything worked.
+  warnings: string[];
+}
+
+async function generateClips(visuals: VisualsOutput): Promise<GenerateClipsResult> {
   const outputDir = path.resolve(process.cwd(), 'output');
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  fs.mkdirSync(outputDir, { recursive: true });
 
   const generateAssets = process.env.GENERATE_ASSETS === 'true';
   const clips: { path: string }[] = [];
   const voiceovers: { path: string }[] = [];
+  const warnings: string[] = [];
 
+  // Dry run (the default) only touches the first scene so nothing costs money by accident.
   const scenesToProcess = generateAssets ? visuals.scenePrompts : visuals.scenePrompts.slice(0, 1);
+
+  if (!generateAssets) {
+    warnings.push('GENERATE_ASSETS is not "true", so clips and voiceovers are empty placeholders (first scene only).');
+  }
 
   for (let i = 0; i < scenesToProcess.length; i++) {
     const scene = scenesToProcess[i];
     if (!scene) continue;
 
-    const clipPath = path.join(outputDir, `clip-${String(i + 1).padStart(2, '0')}.mp4`);
-    const voiceoverPath = path.join(outputDir, `voiceover-${String(i + 1).padStart(2, '0')}.mp3`);
+    const n = String(i + 1).padStart(2, '0');
+    const clipPath = path.join(outputDir, `clip-${n}.mp4`);
+    const voiceoverPath = path.join(outputDir, `voiceover-${n}.mp3`);
 
     if (generateAssets) {
       try {
         await generateClip(scene.prompt, scene.duration, clipPath);
       } catch (err) {
-        console.warn(`Clip generation failed for scene ${i + 1}:`, err);
-        if (!fs.existsSync(clipPath)) {
-          fs.writeFileSync(clipPath, Buffer.from([]));
-        }
-      }
-
-      try {
-        await generateVoiceover(scene.voiceoverText, voiceoverPath);
-      } catch (err) {
-        console.warn(`Voiceover generation failed for scene ${i + 1}:`, err);
-        if (!fs.existsSync(voiceoverPath)) {
-          fs.writeFileSync(voiceoverPath, Buffer.from([]));
-        }
-      }
-
-      // Sync voiceover audio track into clip MP4 video
-      await mergeAudioAndVideo(clipPath, voiceoverPath, clipPath);
-    } else {
-      console.log(`Asset generation not enabled for scene ${i + 1}. Creating placeholder clip and voiceover paths.`);
-      if (!fs.existsSync(clipPath)) {
+        const message = err instanceof Error ? err.message : String(err);
+        warnings.push(`Scene ${i + 1}: clip generation failed (${message}). Wrote an empty placeholder.`);
         fs.writeFileSync(clipPath, Buffer.from([]));
       }
-      if (!fs.existsSync(voiceoverPath)) {
-        fs.writeFileSync(voiceoverPath, Buffer.from([]));
-      }
+
+      const voice = await generateVoiceover(scene.voiceoverText, voiceoverPath);
+      if (voice.warning) warnings.push(`Scene ${i + 1}: ${voice.warning}`);
+
+      await mergeAudioAndVideo(clipPath, voiceoverPath, clipPath);
+    } else {
+      // Never clobber real files from an earlier run with empty ones.
+      if (!fs.existsSync(clipPath)) fs.writeFileSync(clipPath, Buffer.from([]));
+      if (!fs.existsSync(voiceoverPath)) fs.writeFileSync(voiceoverPath, Buffer.from([]));
     }
 
     clips.push({ path: clipPath });
     voiceovers.push({ path: voiceoverPath });
   }
 
-  return { clips, voiceovers };
+  return { clips, voiceovers, warnings };
 }
 
 // ============================================================
