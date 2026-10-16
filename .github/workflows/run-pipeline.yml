@@ -14,6 +14,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -36,7 +39,10 @@ jobs:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
 
+      # Upload even when the run fails, so partial JSON is available for debugging.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: pipeline-output
           path: output/
+          if-no-files-found: ignore
