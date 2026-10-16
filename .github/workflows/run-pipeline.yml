@@ -1,0 +1,42 @@
+name: Run gossip pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product name or URL
+        required: true
+        default: Sol de Janeiro Brazilian Bum Bum Cream
+        type: string
+      generate_assets:
+        description: Generate video and voiceover assets (may incur API costs)
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run pipeline
+        run: npm run pipeline
+        env:
+          PRODUCT_NAME: ${{ inputs.product }}
+          GENERATE_ASSETS: ${{ inputs.generate_assets }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output
+          path: output/
