@@ -51,8 +51,9 @@ async function callStructured<T>(opts: StructuredCall<T>): Promise<T> {
     model: MODEL,
     max_tokens: opts.maxTokens,
     tools: [{ name: opts.name, description: opts.description, input_schema: opts.schema }],
-    tool_choice: { type: 'tool', name: opts.name },
-    messages: [{ role: 'user', content: opts.prompt }],
+    // Forced tool_choice ('tool'/'any') is rejected by some models, so use auto and instruct in the prompt.
+    tool_choice: { type: 'auto' },
+    messages: [{ role: 'user', content: `${opts.prompt}\n\nRespond only by calling the \`${opts.name}\` tool.` }],
   });
 
   if (res.stop_reason === 'max_tokens') {
