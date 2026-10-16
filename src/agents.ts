@@ -129,7 +129,7 @@ async function writeScript(research: ResearchOutput, chosenAngleIndex = 0): Prom
 
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1500,
+    max_tokens: 3000,
     messages: [{
       role: 'user',
       content: `You write TikTok storytime scripts in first-person gossip voice. The script should sound like a real person texting their best friend, not an ad.
@@ -172,7 +172,7 @@ CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdo
 async function directVisuals(scriptOutput: ScriptOutput): Promise<VisualsOutput> {
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1500,
+    max_tokens: 4000,
     messages: [{
       role: 'user',
       content: `You turn TikTok storytime scripts into scene-by-scene video prompts for AI video generation (Seedance model). Each scene is 5-8 seconds.
@@ -196,6 +196,10 @@ CRITICAL: Return ONLY valid, parseable raw JSON object. Do NOT wrap it in markdo
 }`,
     }],
   });
+
+  if (res.stop_reason === 'max_tokens') {
+    throw new Error('Visual director output was truncated (max_tokens reached).');
+  }
 
   const firstVisualBlock = res.content[0];
   const text = firstVisualBlock && firstVisualBlock.type === 'text' ? firstVisualBlock.text : '';
